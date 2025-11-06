@@ -5,7 +5,7 @@ from pyspark.sql.types import StructType, StructField, StringType, LongType, Dou
 
 # Khởi tạo Spark Session
 spark = SparkSession.builder.appName("KinesisConsumer").getOrCreate()
-spark.sparkContext.setLogLevel("ERROR")
+# spark.sparkContext.setLogLevel("ERROR")
 
 # =========================================
 # 1. ĐỊNH NGHĨA SCHEMA CỦA DỮ LIỆU ĐẦU VÀO
