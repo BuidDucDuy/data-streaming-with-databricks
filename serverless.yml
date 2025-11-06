@@ -1,0 +1,39 @@
+service: realtime-api-producer
+provider:
+  name: aws
+  runtime: python3.9 # Hoặc python3.11 nếu muốn
+  region: ap-southeast-1 # Hoặc region bạn muốn, ví dụ: us-east-1
+  stage: dev
+  memorySize: 128
+  timeout: 30 # Tăng timeout để đủ thời gian gọi API và đẩy Kinesis
+  environment:
+    KINESIS_STREAM_NAME: realtime-api-stream
+  iam:
+    role:
+      statements:
+        - Effect: "Allow"
+          Action:
+            - "kinesis:PutRecord"
+            - "kinesis:ListShards" # Cần cho việc đọc stream sau này (Databricks)
+            - "kinesis:DescribeStream" # Cần cho việc đọc stream sau này (Databricks)
+          Resource: "arn:aws:kinesis:${aws:region}:${aws:accountId}:stream/${self:provider.environment.KINESIS_STREAM_NAME}"
+        - Effect: "Allow" # Quyền cơ bản để ghi logs CloudWatch
+          Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+          Resource: "arn:aws:logs:${aws:region}:${aws:accountId}:log-group:/aws/lambda/*:*"
+functions:
+  apiToKinesis:
+    handler: handler.api_to_kinesis
+    events:
+      - schedule:
+          rate: rate(1 day)
+          # Hoặc 'rate(1 minute)' nếu bạn thích cú pháp đơn giản hơn
+resources:
+  Resources:
+    KinesisStream:
+      Type: AWS::Kinesis::Stream
+      Properties:
+        Name: ${self:provider.environment.KINESIS_STREAM_NAME}
+        ShardCount: 1 # 1 shard là đủ cho demo
