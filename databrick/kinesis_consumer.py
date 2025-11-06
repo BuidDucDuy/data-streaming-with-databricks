@@ -1,24 +1,29 @@
 # databricks_notebook/kinesis_consumer.py
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, current_timestamp
-from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, IntegerType, MapType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, IntegerType, ArrayType
+from databricks.sdk import WorkspaceClient
 
-# Khởi tạo Spark Session
+# Khởi tạo Spark Session và dbutils
 spark = SparkSession.builder.appName("KinesisConsumer").getOrCreate()
-# spark.sparkContext.setLogLevel("ERROR")
+w = WorkspaceClient()
+dbutils = w.dbutils
 
 # =========================================
-# 1. ĐỊNH NGHĨA SCHEMA CỦA DỮ LIỆU ĐẦU VÀO
-#    Phải khớp với cấu trúc JSON từ OpenWeatherMap + timestamp
+# 1. ĐỊNH NGHĨA SCHEMA (ĐÃ SỬA LỖI)
+#    Khớp chính xác với JSON của OpenWeatherMap
 # ==========================================
-# Đây là schema rút gọn dựa trên API OpenWeatherMap
 schema = StructType([
-    StructField("coord", MapType(StringType(), DoubleType()), True),
-    StructField("weather", StructType([
+    StructField("coord", StructType([  # <-- SỬA LỖI: Đây là Struct
+        StructField("lon", DoubleType(), True),
+        StructField("lat", DoubleType(), True)
+    ]), True),
+    StructField("weather", ArrayType(StructType([ # <-- SỬA LỖI: Đây là Array
         StructField("id", IntegerType(), True),
         StructField("main", StringType(), True),
-        StructField("description", StringType(), True)
-    ]), True),
+        StructField("description", StringType(), True),
+        StructField("icon", StringType(), True)
+    ])), True),
     StructField("main", StructType([
         StructField("temp", DoubleType(), True),
         StructField("feels_like", DoubleType(), True),
@@ -27,59 +32,67 @@ schema = StructType([
         StructField("pressure", IntegerType(), True),
         StructField("humidity", IntegerType(), True)
     ]), True),
-    StructField("wind", MapType(StringType(), DoubleType()), True),
-    StructField("name", StringType(), True), # Tên thành phố (ví dụ: Hanoi)
+    StructField("wind", StructType([ # <-- SỬA LỖI: Đây là Struct
+        StructField("speed", DoubleType(), True),
+        StructField("deg", IntegerType(), True),
+        StructField("gust", DoubleType(), True)
+    ]), True),
+    StructField("name", StringType(), True), # Tên thành phố
     StructField("cod", IntegerType(), True),
     StructField("timestamp", LongType(), True) # Timestamp chúng ta thêm vào
 ])
 
 # ==========================================
-# 2. ĐỌC DỮ LIỆU TỪ KINESIS STREAM
+# 2. ĐỌC DỮ LIỆU TỪ KINESIS STREAM (ĐÃ SỬA LỖI)
 # ==========================================
-kinesis_stream_name = "realtime-api-stream" # Tên Kinesis stream của bạn
-aws_region = "ap-southeast-1" # Region AWS của bạn (phải khớp với Kinesis)
 
-# Đảm bảo cluster Databricks có quyền IAM để đọc từ Kinesis.
-# (kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream, kinesis:ListShards)
+# Lấy credentials một cách an toàn từ Databricks Secrets
+aws_access_key = dbutils.secrets.get(scope="kinesis_creds", key="aws_access_key")
+aws_secret_key = dbutils.secrets.get(scope="kinesis_creds", key="aws_secret_key")
+
+kinesis_stream_name = "realtime-api-stream"
+aws_region = "ap-southeast-1" 
 
 df_kinesis = spark.readStream \
     .format("kinesis") \
     .option("streamName", kinesis_stream_name) \
     .option("region", aws_region) \
-    .option("initialPosition", "LATEST") \
+    .option("initialPosition", "TRIM_HORIZON") \
+    .option("awsAccessKey", aws_access_key) \
+    .option("awsSecretKey", aws_secret_key)  \
     .load()
 
-
 # ==========================================
-# 3. XỬ LÝ DỮ LIỆU
+# 3. XỬ LÝ DỮ LIỆU (ĐÃ SỬA LỖI)
 # ==========================================
 df_parsed = df_kinesis \
     .selectExpr("CAST(data AS STRING) as json_data") \
     .withColumn("parsed_data", from_json(col("json_data"), schema)) \
     .select(
         col("parsed_data.name").alias("city_name"),
-        col("parsed_data.weather.main").alias("weather_condition"),
-        col("parsed_data.weather.description").alias("weather_description"),
+        # SỬA LỖI: Lấy phần tử đầu tiên [0] của mảng "weather"
+        col("parsed_data.weather")[0].main.alias("weather_condition"),
+        col("parsed_data.weather")[0].description.alias("weather_description"),
         col("parsed_data.main.temp").alias("temperature_celsius"),
         col("parsed_data.main.humidity").alias("humidity_percent"),
+        # SỬA LỖI: Truy cập "speed" bên trong "wind"
         col("parsed_data.wind.speed").alias("wind_speed_mps"),
         col("parsed_data.timestamp").alias("event_timestamp_ms"),
-        current_timestamp().alias("processing_timestamp") # Thời điểm Databricks xử lý
+        current_timestamp().alias("processing_timestamp")
     )
 
 # ==========================================
-# 4. GHI DỮ LIỆU VÀO DELTA LAKE
+# 4. GHI DỮ LIỆU VÀO DELTA LAKE (Đã đúng)
 # ==========================================
-output_path = "/delta/weather_data_stream" # Đường dẫn đến bảng Delta Lake trên DBFS/S3
+table_name = "workspace.default.weather_data_stream" 
+checkpoint_path = "/Volumes/workspace/default/streaming_checkpoints/weather_data_stream_cp"
 
-# Ghi stream vào Delta Lake
 query = df_parsed.writeStream \
     .format("delta") \
     .outputMode("append") \
-    .option("checkpointLocation", f"{output_path}/_checkpoints") \
-    .option("path", output_path) \
-    .trigger(processingTime="1 minute") \
-    .start()
+    .option("checkpointLocation", checkpoint_path) \
+    .trigger(availableNow=True) \
+    .toTable(table_name)
 
 print(f"Databricks Structured Stream started for Kinesis stream: {kinesis_stream_name}")
-print(f"Data is being written to Delta Lake at: {output_path}")
+print(f"Data is being written to Delta Table: {table_name}")
